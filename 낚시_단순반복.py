@@ -270,6 +270,7 @@ class RepeatConfig:
     delay_seconds: float = REPEAT_DELAY_SECONDS
     focus_settle_seconds: float = FOCUS_SETTLE_DELAY_SECONDS
     command: str = DEFAULT_COMMAND
+    max_success_count: int | None = None
 
 
 @dataclass(slots=True)
@@ -391,6 +392,12 @@ class SimpleRepeatController:
             self.failure_count += 1
             self.last_status = f'{self.config.command} 전송 실패'
         self._emit(f'[전송] {self.config.command} 전송 성공' if ok else f'[전송] {self.config.command} 전송 실패')
+        if ok and self.config.max_success_count is not None and self.success_count >= self.config.max_success_count:
+            self.shutdown_requested = True
+            self.running = False
+            self._stop_event.set()
+            self.last_status = f'목표 {self.config.max_success_count}회 완료'
+            self._emit(f'[완료] 목표 {self.config.max_success_count}회 도달')
         return ok
 
     def start_loop(self) -> None:
@@ -464,7 +471,7 @@ def missing_simple_repeat_dependencies(*, on_windows: bool | None = None) -> lis
     return [name for name in required if importlib.util.find_spec(name) is None]
 
 
-# 실행
+# 실행 진입점
 
 def capture_foreground_target() -> RepeatTarget:
     import pyautogui  # type: ignore
@@ -476,6 +483,22 @@ def capture_foreground_target() -> RepeatTarget:
     return RepeatTarget(window_handle=handle, window_title=title, input_x=int(x), input_y=int(y))
 
 
+def prompt_repeat_limit(*, input_fn=input, notify=append_log) -> int | None:
+    while True:
+        raw = input_fn('반복 횟수 입력 (0 또는 빈값 = 무한 반복): ').strip()
+        if raw in {'', '0'}:
+            return None
+        try:
+            value = int(raw)
+        except ValueError:
+            notify('반복 횟수는 0 이상 정수로 입력하세요.')
+            continue
+        if value < 0:
+            notify('반복 횟수는 0 이상 정수로 입력하세요.')
+            continue
+        return value
+
+
 def finalize_run(controller: SimpleRepeatController) -> int:
     summary = controller.summary_text()
     append_log(summary)
@@ -483,11 +506,12 @@ def finalize_run(controller: SimpleRepeatController) -> int:
     return 0
 
 
-def emit_session_banner() -> None:
+def emit_session_banner(*, repeat_limit: int | None) -> None:
     append_log('=== 낚시 단순반복 ===')
     append_log('F9  : 대상 창 + 입력 위치 지정')
     append_log('F10 : 시작 / 일시정지 / 재개')
     append_log('F12 : 정지')
+    append_log('반복 횟수: 무한 반복' if repeat_limit is None else f'반복 횟수: {repeat_limit}회')
     append_log(f'종료 요약 파일: {SUMMARY_PATH}')
     append_log('종료하려면 Ctrl+C')
 
@@ -504,7 +528,12 @@ def run_program() -> int:
 
     import keyboard  # type: ignore
 
-    controller = SimpleRepeatController(runtime=SimpleRepeatRuntime(event_sink=append_log), config=RepeatConfig(), event_sink=append_log)
+    repeat_limit = prompt_repeat_limit()
+    controller = SimpleRepeatController(
+        runtime=SimpleRepeatRuntime(event_sink=append_log),
+        config=RepeatConfig(max_success_count=repeat_limit),
+        event_sink=append_log,
+    )
 
     def capture_target():
         append_log('3초 안에 카카오톡 입력창 위에 마우스를 올리고 창을 클릭하세요...')
@@ -517,7 +546,7 @@ def run_program() -> int:
     keyboard.add_hotkey('f10', lambda: handle_f10_press(controller, notify=append_log))
     keyboard.add_hotkey('f12', controller.request_shutdown)
 
-    emit_session_banner()
+    emit_session_banner(repeat_limit=repeat_limit)
 
     try:
         while not controller.shutdown_requested:
